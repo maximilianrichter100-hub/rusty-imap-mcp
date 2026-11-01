@@ -6,6 +6,15 @@ name: Dependabot fuzz-lock realign
 # `just realign-fuzz-locks` on the PR and pushes the result, so the chore stops
 # being manual. See docs/ADR/0016-dependabot-fuzz-lock-auto-realign.md.
 #
+# The compiler-probe fixture lockfiles (`crates/*/tests/fixtures/*/Cargo.lock`,
+# read by the E0639 tests with `cargo check --locked`) have the same problem
+# and the same gate: `just check-compiler-probe-locks` in the `cargo-deny` job
+# requires every registry package they pin to be in the workspace lock. A bump
+# of a crate they resolve (#905, async-imap 0.11 -> 0.12) left them stale, so
+# the PR failed `cargo-deny` and both test jobs. They are realigned here too,
+# with `just realign-compiler-probe-locks`, which is likewise `cargo metadata`
+# only — the no-head-file-is-executed property below holds unchanged.
+#
 # `pull_request_target` + a write credential + PR-head content is the most
 # exploited pattern in GitHub Actions. The one property that contains it here:
 #
@@ -399,10 +408,31 @@ jobs:
         if: steps.scope.outputs.in_scope == 'true'
         run: just check-fuzz-lock-parity
 
+      # Same shape as the fuzz realign above: the base branch's recipe and
+      # script. The script discovers the probe fixtures from the base tree's
+      # tracked test sources (the index is still the base commit), seeds each
+      # fixture lockfile from the overlaid workspace lock, and lets
+      # `cargo metadata` prune it to the fixture's graph. It copies the base
+      # tree's fixture `src/` into a scratch directory but never compiles it;
+      # `cargo metadata` resolves and downloads, nothing more.
+      - name: Realign the compiler-probe lockfiles
+        if: steps.scope.outputs.in_scope == 'true'
+        run: just realign-compiler-probe-locks
+
+      # The exact check the required `cargo-deny` job runs.
+      - name: Re-check the compiler-probe lockfiles
+        if: steps.scope.outputs.in_scope == 'true'
+        run: just check-compiler-probe-locks
+
       # Lift the realigned lockfiles out, then throw the whole working tree
       # away. What gets committed is built from the pristine head tree plus
-      # these two files, so nothing else the realign or the overlay touched can
+      # these files, so nothing else the realign or the overlay touched can
       # reach the PR even by accident.
+      #
+      # The probe pathspec is a plain one, so `*` crosses `/` and reaches the
+      # fixture directory under `tests/`. It may also list a tracked lockfile
+      # under `tests/` that is not a probe fixture; that file is copied back
+      # unchanged and drops out of `git status` below.
       - name: Save the realigned lockfiles
         if: steps.scope.outputs.in_scope == 'true'
         run: |
@@ -412,6 +442,8 @@ jobs:
             echo "::error::no tracked fuzz lockfiles found; nothing to save."
             exit 1
           fi
+          git ls-files 'crates/*/tests/*/Cargo.lock' \
+            >> "$RUNNER_TEMP/fuzz-locks.txt"
           while IFS= read -r lock; do
             mkdir -p "$RUNNER_TEMP/locks/$(dirname "$lock")"
             cp "$lock" "$RUNNER_TEMP/locks/$lock"
@@ -434,7 +466,8 @@ jobs:
           done < "$RUNNER_TEMP/fuzz-locks.txt"
           git status --porcelain > "$RUNNER_TEMP/status.txt"
           if [ ! -s "$RUNNER_TEMP/status.txt" ]; then
-            echo "the fuzz lockfiles are already in parity; nothing to push"
+            echo "the fuzz and compiler-probe lockfiles are already in parity;" \
+                 "nothing to push"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -443,9 +476,9 @@ jobs:
           # Belt and braces: by construction only the saved lockfiles were
           # written back, so anything else here means an assumption broke.
           if cut -c4- "$RUNNER_TEMP/status.txt" \
-              | grep -vqE '^(.*/)?fuzz/Cargo\.lock$'; then
+              | grep -vqE '^((.*/)?fuzz|crates/[^/]+/tests/.+)/Cargo\.lock$'; then
             echo "::error::the tree carries changes outside the tracked fuzz" \
-                 "lockfiles. Refusing to push."
+                 "and compiler-probe lockfiles. Refusing to push."
             exit 1
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -501,9 +534,11 @@ jobs:
           # The same two pathspecs the parity script discovers the tracked set
           # with (FUZZ_LOCK_GLOBS). Plain pathspecs, not `:(glob)` magic —
           # git's default wildmatch lets `*` cross `/`, which is what reaches
-          # the nested `crates/rimap-server/fuzz/Cargo.lock`.
-          git add -- 'fuzz/Cargo.lock' '*/fuzz/Cargo.lock'
-          git commit -m 'deps(fuzz): realign the fuzz lockfiles with the bumped workspace lock' \
+          # the nested `crates/rimap-server/fuzz/Cargo.lock`. The third is the
+          # compiler-probe pathspec from the save step.
+          git add -- 'fuzz/Cargo.lock' '*/fuzz/Cargo.lock' \
+            'crates/*/tests/*/Cargo.lock'
+          git commit -m 'deps(fuzz): realign the fuzz and compiler-probe lockfiles with the bumped workspace lock' \
                      -m 'Automated by .github/workflows/dependabot-fuzz-lock.yml (issue #698).'
           git push "https://x-access-token:${REALIGN_TOKEN}@github.com/${GH_REPO}.git" \
             "HEAD:refs/heads/${HEAD_REF}"
